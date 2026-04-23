@@ -25,6 +25,7 @@ from swebench.harness.docker_utils import (
     list_images,
     should_remove,
     clean_images,
+    ensure_image_loaded,
 )
 from swebench.harness.docker_build import (
     BuildImageError,
@@ -227,6 +228,7 @@ def run_instances(
         max_workers: int,
         run_id: str,
         timeout: int,
+        multiarch: bool = False,
     ):
     """
     Run all instances for the given predictions in parallel.
@@ -242,7 +244,7 @@ def run_instances(
         timeout (int): Timeout for running tests
     """
     client = docker.from_env()
-    test_specs = list(map(make_test_spec, instances))
+    test_specs = [make_test_spec(inst, multiarch=multiarch) for inst in instances]
 
     # print number of existing instance images
     instance_image_ids = {x.instance_image_key for x in test_specs}
@@ -356,7 +358,8 @@ def make_run_report(
         predictions: dict,
         full_dataset: list,
         client: docker.DockerClient,
-        run_id: str
+        run_id: str,
+        multiarch: bool = False,
     ) -> Path:
     """
     Make a final evaluation and run report of the instances that have been run.
@@ -415,7 +418,7 @@ def make_run_report(
 
     # get remaining images and containers
     images = list_images(client)
-    test_specs = list(map(make_test_spec, full_dataset))
+    test_specs = [make_test_spec(inst, multiarch=multiarch) for inst in full_dataset]
     for spec in test_specs:
         image_name = spec.instance_image_key
         if image_name in images:
@@ -496,6 +499,7 @@ def main(
         open_file_limit: int,
         run_id: str,
         timeout: int,
+        multiarch: bool = False,
     ):
     """
     Run evaluation harness for the given dataset and predictions.
@@ -529,12 +533,12 @@ def main(
         print("No instances to run.")
     else:
         # build environment images + run instances
-        build_env_images(client, dataset, force_rebuild, max_workers)
-        run_instances(predictions, dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout)
+        build_env_images(client, dataset, force_rebuild, max_workers, multiarch=multiarch)
+        run_instances(predictions, dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout, multiarch=multiarch)
 
     # clean images + make final report
     clean_images(client, existing_images, cache_level, clean)
-    make_run_report(predictions, full_dataset, client, run_id)
+    make_run_report(predictions, full_dataset, client, run_id, multiarch=multiarch)
 
 
 if __name__ == "__main__":
@@ -542,7 +546,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_name", default="princeton-nlp/SWE-bench_Lite", type=str, help="Name of dataset or path to JSON file.")
     parser.add_argument("--split", type=str, default="test", help="Split of the dataset")
     parser.add_argument("--instance_ids", nargs="+", type=str, help="Instance IDs to run (space separated)")
-    parser.add_argument("--predictions_path", type=str, help="Path to predictions file - if 'gold', uses gold predictions", required=True)
+    parser.add_argument("--predictions_path", type=str, help="Path to predictions file (.json or .jsonl)")
+    parser.add_argument("--gold", action="store_true", default=False, help="Use gold predictions (ground-truth patches from dataset)")
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of workers (should be <= 75%% of CPU cores)")
     parser.add_argument("--open_file_limit", type=int, default=4096, help="Open file limit")
     parser.add_argument(
@@ -564,6 +569,12 @@ if __name__ == "__main__":
         "--clean", type=str2bool, default=False, help="Clean images above cache level"
     )
     parser.add_argument("--run_id", type=str, required=True, help="Run ID - identifies the run")
+    parser.add_argument("--multiarch", type=str2bool, default=False, help="Use arch-free image names (for multi-arch buildx images)")
     args = parser.parse_args()
-
-    main(**vars(args))
+    if args.gold and args.predictions_path:
+        parser.error("--gold and --predictions_path are mutually exclusive")
+    if not args.gold and not args.predictions_path:
+        parser.error("either --gold or --predictions_path is required")
+    if args.gold:
+        args.predictions_path = "gold"
+    main(**{k: v for k, v in vars(args).items() if k != "gold"})

@@ -301,10 +301,26 @@ def get_test_directives(instance: SWEbenchInstance) -> list:
     # Get test directives from test patch and remove non-test files
     diff_pat = r"diff --git a/.* b/(.*)"
     test_patch = instance["test_patch"]
-    directives = re.findall(diff_pat, test_patch)
-    directives = [
-        d for d in directives if not any(d.endswith(ext) for ext in NON_TEST_EXTS)
-    ]
+    directives_raw = re.findall(diff_pat, test_patch)
+
+    # For sqlfluff, map YAML/SQL fixture files to their test runner files before filtering
+    if instance["repo"] == "sqlfluff/sqlfluff":
+        fixture_runners = set()
+        non_fixture = []
+        for d in directives_raw:
+            if d.startswith("test/fixtures/rules/std_rule_cases/"):
+                fixture_runners.add("test/rules/yaml_test_cases_test.py")
+            elif d.startswith("test/fixtures/dialects/"):
+                fixture_runners.add("test/dialects/dialects_test.py")
+            else:
+                non_fixture.append(d)
+        directives = [
+            d for d in non_fixture if not any(d.endswith(ext) for ext in NON_TEST_EXTS)
+        ] + list(fixture_runners)
+    else:
+        directives = [
+            d for d in directives_raw if not any(d.endswith(ext) for ext in NON_TEST_EXTS)
+        ]
 
     # For Django tests, remove extension + "tests/" prefix and convert slashes to dots (module referencing)
     if instance["repo"] == "django/django":

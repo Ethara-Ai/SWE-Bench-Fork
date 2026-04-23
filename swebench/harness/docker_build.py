@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
+import shutil
+import subprocess
 import traceback
+
 import docker
 import docker.errors
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
 USE_HOST_NETWORK = False
 
 from swebench.harness.constants import (
@@ -15,6 +21,12 @@ from swebench.harness.constants import (
     ENV_IMAGE_BUILD_DIR,
     INSTANCE_IMAGE_BUILD_DIR,
     MAP_REPO_VERSION_TO_SPECS,
+    USE_X86,
+)
+from swebench.harness.dockerfiles import (
+    get_dockerfile_base,
+    get_dockerfile_env,
+    get_dockerfile_instance,
 )
 from swebench.harness.test_spec import (
     get_test_specs_from_dataset,
@@ -120,6 +132,14 @@ def build_image(
         logger.info(
             f"Building docker image {image_name} in {build_dir} with platform {platform}"
         )
+
+        proxy_buildargs = {}
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy"):
+            val = os.environ.get(var, "")
+            if val:
+                proxy_buildargs[var] = val
+
         response = client.api.build(
             path=str(build_dir),
             tag=image_name,
@@ -130,6 +150,7 @@ def build_image(
             nocache=nocache,
             network_mode="host" if USE_HOST_NETWORK else None,
             container_limits={"memory": 8 * 1024 * 1024 * 1024},
+            buildargs=proxy_buildargs if proxy_buildargs else None,
         )
 
         # Log the build process continuously
@@ -159,10 +180,480 @@ def build_image(
         close_logger(logger)  # functions that create loggers should close them
 
 
+_SKOPEO_MIN_VERSION = (1, 14, 2)
+
+
+def _check_skopeo_available():
+    if not shutil.which("skopeo"):
+        raise RuntimeError(
+            "skopeo not found. Install: brew install skopeo (macOS) / "
+            "apt install skopeo (Debian)"
+        )
+    try:
+        result = subprocess.run(
+            ["skopeo", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        version_str = result.stdout.strip().split()[-1]
+        parts = version_str.split(".")
+        import re as _re
+        version = tuple(int(m.group()) for p in parts[:3] if (m := _re.match(r'\d+', p)))
+        version = version + (0,) * (3 - len(version))
+        if version < _SKOPEO_MIN_VERSION:
+            min_str = ".".join(str(v) for v in _SKOPEO_MIN_VERSION)
+            raise RuntimeError(
+                f"skopeo {version_str} too old. Need >= {min_str} for "
+                "Docker 25+ compatibility. See skopeo#2202."
+            )
+    except (ValueError, IndexError, AttributeError) as e:
+        logging.getLogger("swebench").warning(
+            f"Could not parse skopeo version (proceeding anyway): {e}"
+        )
+
+
+def _check_buildx_builder(builder_name: str = "swegym-multiarch"):
+    result = subprocess.run(
+        ["docker", "buildx", "inspect", "--bootstrap", builder_name],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"Builder '{builder_name}' not found — creating with host networking...")
+        create = subprocess.run(
+            [
+                "docker", "buildx", "create",
+                "--name", builder_name,
+                "--driver", "docker-container",
+                "--driver-opt", "network=host",
+                "--bootstrap",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if create.returncode != 0:
+            raise RuntimeError(
+                f"Failed to create buildx builder '{builder_name}': {create.stderr}\n"
+                f"Try manually: docker buildx create --name {builder_name} "
+                f"--driver docker-container --driver-opt network=host --bootstrap"
+            )
+        result = subprocess.run(
+            ["docker", "buildx", "inspect", builder_name],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    if "network=" in result.stdout and 'network="host"' not in result.stdout:
+        print(
+            f"WARNING: Builder '{builder_name}' exists but lacks --driver-opt network=host.\n"
+            f"Registry access from buildx will fail. Recreate with:\n"
+            f"  docker buildx rm {builder_name}\n"
+            f"  docker buildx create --name {builder_name} --driver docker-container "
+            f"--driver-opt network=host --bootstrap"
+        )
+
+    if "linux/amd64" not in result.stdout or "linux/arm64" not in result.stdout:
+        raise RuntimeError(
+            f"Builder '{builder_name}' missing platform support. "
+            "Run: docker run --rm --privileged tonistiigi/binfmt --install all"
+        )
+
+
+def ensure_registry_running(
+    port: int = 5000,
+    timeout: int = 30,
+) -> str:
+    """Start a local OCI registry if not already running. Returns 'localhost:{port}'."""
+    import urllib.request
+    import time
+
+    addr = f"localhost:{port}"
+    health_url = f"http://{addr}/v2/"
+
+    try:
+        urllib.request.urlopen(health_url, timeout=3)
+        if _probe_registry_push(addr):
+            return addr
+    except Exception:
+        pass
+
+    container_name = "swegym-registry"
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True, timeout=10,
+    )
+    result = subprocess.run(
+        [
+            "docker", "run", "-d",
+            "-p", f"{port}:{port}",
+            "--restart=always",
+            "--name", container_name,
+            "-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
+            "registry:2",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to start registry on port {port}: {result.stderr}\n"
+            f"Possible port conflict. Try: --registry localhost:5001"
+        )
+
+    delay = 0.5
+    elapsed = 0.0
+    while elapsed < timeout:
+        try:
+            urllib.request.urlopen(health_url, timeout=2)
+            if _probe_registry_push(addr):
+                return addr
+        except Exception:
+            pass
+        time.sleep(delay)
+        elapsed += delay
+        delay = min(delay * 1.5, 5.0)
+
+    raise RuntimeError(f"Registry started but not healthy after {timeout}s")
+
+
+def _probe_registry_push(registry_addr: str) -> bool:
+    import json
+    import tempfile
+    import tarfile
+    import gzip
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="swegym-probe-") as tmpdir:
+            probe_dir = Path(tmpdir)
+
+            oci_layout = {"imageLayoutVersion": "1.0.0"}
+            (probe_dir / "oci-layout").write_text(json.dumps(oci_layout))
+
+            blobs_dir = probe_dir / "blobs" / "sha256"
+            blobs_dir.mkdir(parents=True)
+
+            empty_tar_content = b"\x00" * 1024
+            config = json.dumps({
+                "architecture": "amd64",
+                "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(empty_tar_content).hexdigest()]},
+            }).encode()
+            config_digest = hashlib.sha256(config).hexdigest()
+            (blobs_dir / config_digest).write_bytes(config)
+
+            empty_layer = gzip.compress(empty_tar_content)
+            layer_digest = hashlib.sha256(empty_layer).hexdigest()
+            (blobs_dir / layer_digest).write_bytes(empty_layer)
+
+            manifest = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": f"sha256:{config_digest}",
+                    "size": len(config),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": f"sha256:{layer_digest}",
+                    "size": len(empty_layer),
+                }],
+            }).encode()
+            manifest_digest = hashlib.sha256(manifest).hexdigest()
+            (blobs_dir / manifest_digest).write_bytes(manifest)
+
+            index = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": f"sha256:{manifest_digest}",
+                    "size": len(manifest),
+                    "platform": {"architecture": "amd64", "os": "linux"},
+                }],
+            }).encode()
+            (probe_dir / "index.json").write_text(index.decode())
+
+            probe_tar = probe_dir / "probe.tar"
+            with tarfile.open(probe_tar, "w") as tf:
+                for p in probe_dir.rglob("*"):
+                    if p == probe_tar:
+                        continue
+                    tf.add(p, arcname=str(p.relative_to(probe_dir)))
+
+            result = subprocess.run(
+                [
+                    "skopeo", "copy", "--dest-tls-verify=false",
+                    f"oci-archive:{probe_tar}",
+                    f"docker://{registry_addr}/swegym-probe:latest",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                probe_ref = f"docker://{registry_addr}/swegym-probe:latest"
+                inspect_res = subprocess.run(
+                    ["skopeo", "inspect", "--tls-verify=false", "--raw", probe_ref],
+                    capture_output=True, timeout=10,
+                )
+                if inspect_res.returncode == 0:
+                    probe_digest = "sha256:" + hashlib.sha256(inspect_res.stdout).hexdigest()
+                    subprocess.run(
+                        ["skopeo", "delete", "--tls-verify=false",
+                         f"docker://{registry_addr}/swegym-probe@{probe_digest}"],
+                        capture_output=True, timeout=10,
+                    )
+                else:
+                    subprocess.run(
+                        ["skopeo", "delete", "--tls-verify=false", probe_ref],
+                        capture_output=True, timeout=10,
+                    )
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def build_image_buildx(
+    image_name: str,
+    setup_scripts: dict[str, str],
+    dockerfile: str,
+    platforms: list[str],
+    build_dir: Path,
+    output_dir: Path | None = None,
+    nocache: bool = False,
+    builder_name: str = "swegym-multiarch",
+    registry: str | None = None,
+    cache_dir: Path | None = None,
+    push_to_registry: bool = False,
+    timeout: int = 7200,
+) -> tuple[Path, str]:
+    if registry is None:
+        registry = "localhost:5000"
+    if output_dir is None:
+        output_dir = build_dir / "output"
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    (build_dir / "Dockerfile").write_text(dockerfile)
+    for fname, content in setup_scripts.items():
+        (build_dir / fname).write_text(content)
+
+    tar_name = image_name.replace(":", "_").replace("/", "_") + ".tar"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = output_dir / tar_name
+
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / (
+        image_name.replace(":", "_").replace("/", "_") + ".build.log"
+    )
+
+    _MAX_LOG_BYTES = 100 * 1024 * 1024
+    if log_file.exists() and log_file.stat().st_size > _MAX_LOG_BYTES:
+        with open(log_file, "rb") as f:
+            f.seek(-(_MAX_LOG_BYTES // 2), 2)
+            tail = f.read()
+        with open(log_file, "wb") as f:
+            f.write(b"[... truncated by log rotation ...]\n")
+            f.write(tail)
+
+    cmd = [
+        "docker", "buildx", "build",
+        "--builder", builder_name,
+        "--platform", ",".join(platforms),
+        "--output", f"type=oci,dest={tar_path}",
+        "--progress", "plain",
+        "--allow", "network.host",
+        "--network", "host",
+        "--provenance=false",
+        "--sbom=false",
+        "--file", str(build_dir / "Dockerfile"),
+    ]
+
+    if cache_dir:
+        cache_key = image_name.split(":")[0].replace("/", "_").replace(".", "_")
+        cache_path = cache_dir / cache_key
+        cmd.extend(["--cache-to", f"type=local,dest={cache_path},mode=max"])
+        cmd.extend(["--cache-from", f"type=local,src={cache_path}"])
+
+    if nocache:
+        cmd.append("--no-cache")
+
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "no_proxy"):
+        val = os.environ.get(var, "")
+        if val:
+            cmd.extend(["--build-arg", f"{var}={val}"])
+
+    mitm_cert = os.environ.get("MITM_CERT_FILE", "")
+    if mitm_cert and Path(mitm_cert).is_file():
+        cmd.extend(["--secret", f"id=mitm_ca,src={mitm_cert}"])
+
+    cmd.append(str(build_dir))
+
+    logger = setup_logger(image_name, log_dir / "orchestration.log", mode="a")
+    logger.info(f"Building multi-arch image: {image_name}")
+    logger.info(f"  Platforms: {', '.join(platforms)}")
+    logger.info(f"  Output: {tar_path}")
+    logger.info(f"  Command: {' '.join(cmd)}")
+
+    with open(log_file, "a") as log_fh:
+        result = subprocess.run(
+            cmd, stdout=log_fh, stderr=subprocess.STDOUT, timeout=timeout,
+        )
+
+    if result.returncode != 0:
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+            error_tail = "".join(lines[-50:])
+        logger.error(f"Build failed for {image_name}. Log: {log_file}\n{error_tail}")
+        close_logger(logger)
+        raise BuildImageError(image_name, f"buildx failed. See {log_file}", logger)
+
+    size_gb = tar_path.stat().st_size / 1e9
+    logger.info(f"Built {image_name} -> {tar_path} ({size_gb:.2f} GB)")
+
+    if not _validate_oci_tar(tar_path, platforms, logger):
+        close_logger(logger)
+        raise BuildImageError(image_name, f"OCI tar validation failed. See {log_file}", logger)
+
+    digest = ""
+    if push_to_registry:
+        digest = _push_tar_to_registry(tar_path, image_name, registry, logger)
+
+    close_logger(logger)
+    return tar_path, digest
+
+
+def _push_tar_to_registry(tar_path: Path, image_name: str, registry: str, logger) -> str:
+    _check_skopeo_available()
+    registry_ref = f"docker://{registry}/{image_name}"
+    cmd = [
+        "skopeo", "copy", "--all",
+        "--dest-tls-verify=false",
+        f"oci-archive:{tar_path}",
+        registry_ref,
+    ]
+    logger.info(f"Pushing {tar_path} -> {registry_ref}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        logger.error(f"Push failed: {result.stderr}")
+        raise RuntimeError(f"skopeo push failed for {image_name}: {result.stderr[-500:]}")
+
+    inspect_result = subprocess.run(
+        ["skopeo", "inspect", "--tls-verify=false", "--raw", registry_ref],
+        capture_output=True, timeout=30,
+    )
+    pushed_digest = ""
+    if inspect_result.returncode == 0:
+        pushed_digest = "sha256:" + hashlib.sha256(inspect_result.stdout).hexdigest()
+
+    logger.info(f"Pushed {image_name} to {registry} (digest: {pushed_digest or 'unknown'})")
+    return pushed_digest
+
+
+def _rollback_registry_image(image_name: str, registry: str, logger, digest: str = ""):
+    if digest:
+        registry_ref = f"docker://{registry}/{image_name.split(':')[0]}@{digest}"
+    else:
+        registry_ref = f"docker://{registry}/{image_name}"
+        logger.warning(
+            f"No digest available for rollback of {image_name}. "
+            "Falling back to tag deletion — this may affect shared tags."
+        )
+    try:
+        result = subprocess.run(
+            ["skopeo", "delete", "--tls-verify=false", registry_ref],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logger.warning(f"Rolled back stale image from registry: {image_name}")
+        else:
+            logger.warning(f"Rollback skipped (image may not exist): {result.stderr[:200]}")
+    except Exception as e:
+        logger.warning(f"Rollback failed for {image_name}: {e}")
+
+
+def _validate_oci_tar(tar_path: Path, expected_platforms: list[str], logger) -> bool:
+    import json
+
+    if not tar_path.exists():
+        logger.error(f"OCI tar not found: {tar_path}")
+        return False
+
+    size_bytes = tar_path.stat().st_size
+    if size_bytes < 1024:
+        logger.error(f"OCI tar suspiciously small ({size_bytes} bytes): {tar_path}")
+        return False
+
+    try:
+        result = subprocess.run(
+            ["skopeo", "inspect", "--raw", f"oci-archive:{tar_path}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            logger.error(f"skopeo inspect failed on {tar_path}: {result.stderr[:200]}")
+            return False
+
+        manifest = json.loads(result.stdout)
+
+        if manifest.get("mediaType", "").endswith("image.index") or "manifests" in manifest:
+            found_platforms = set()
+            for m in manifest.get("manifests", []):
+                plat = m.get("platform", {})
+                arch = plat.get("architecture", "")
+                os_ = plat.get("os", "")
+                if os_ == "unknown":
+                    logger.debug(f"Skipping attestation manifest: {plat}")
+                    continue
+                if arch and os_:
+                    found_platforms.add(f"{os_}/{arch}")
+
+            for expected in expected_platforms:
+                if expected not in found_platforms:
+                    logger.error(
+                        f"OCI tar missing platform {expected}. "
+                        f"Found: {found_platforms}. Tar: {tar_path}"
+                    )
+                    return False
+
+            logger.info(
+                f"OCI tar validated: {tar_path} "
+                f"({size_bytes / 1e9:.2f} GB, platforms: {found_platforms})"
+            )
+        else:
+            config_digest = manifest.get("config", {}).get("digest", "")
+            if config_digest and expected_platforms:
+                config_result = subprocess.run(
+                    ["skopeo", "inspect", f"oci-archive:{tar_path}"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if config_result.returncode == 0:
+                    config_info = json.loads(config_result.stdout)
+                    tar_arch = config_info.get("Architecture", "")
+                    tar_os = config_info.get("Os", "linux")
+                    tar_platform = f"{tar_os}/{tar_arch}"
+                    if expected_platforms and tar_platform not in expected_platforms:
+                        logger.error(
+                            f"OCI tar platform mismatch: {tar_path} has {tar_platform}, "
+                            f"expected one of {expected_platforms}"
+                        )
+                        return False
+            logger.info(
+                f"OCI tar validated (single-arch): {tar_path} ({size_bytes / 1e9:.2f} GB)"
+            )
+
+        return True
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Failed to parse OCI manifest in {tar_path}: {e}")
+        return False
+
+
 def build_base_images(
         client: docker.DockerClient,
         dataset: list,
-        force_rebuild: bool = False
+        force_rebuild: bool = False,
+        use_buildx: bool = False,
+        platforms: list[str] | None = None,
+        output_dir: Path | None = None,
+        registry: str | None = None,
+        cache_dir: Path | None = None,
+        skip_registry: bool = False,
+        multiarch: bool = False,
     ):
     """
     Builds the base images required for the dataset if they do not already exist.
@@ -172,8 +663,34 @@ def build_base_images(
         dataset (list): List of test specs or dataset to build images for
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
     """
+    if use_buildx:
+        _check_buildx_builder()
+        _check_skopeo_available()
+        platforms = platforms or ["linux/amd64", "linux/arm64"]
+        if not skip_registry:
+            registry_addr = ensure_registry_running()
+        else:
+            registry_addr = registry or "localhost:5000"
+
+        test_specs = get_test_specs_from_dataset(dataset, multiarch=True)
+        base_images = {x.base_image_key: (x.base_dockerfile, x.platform) for x in test_specs}
+        for image_name, (dockerfile, platform) in base_images.items():
+            tar_path, digest = build_image_buildx(
+                image_name=image_name,
+                setup_scripts={},
+                dockerfile=get_dockerfile_base("", "", use_buildx=True),
+                platforms=platforms,
+                build_dir=BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                output_dir=output_dir,
+                push_to_registry=not skip_registry,
+                registry=registry_addr,
+                cache_dir=cache_dir,
+            )
+        print("Base images built successfully (buildx).")
+        return
+
     # Get the base images to build from the dataset
-    test_specs = get_test_specs_from_dataset(dataset)
+    test_specs = get_test_specs_from_dataset(dataset, multiarch=multiarch)
     base_images = {
         x.base_image_key: (x.base_dockerfile, x.platform) for x in test_specs
     }
@@ -210,6 +727,7 @@ def build_base_images(
 def get_env_configs_to_build(
         client: docker.DockerClient,
         dataset: list,
+        multiarch: bool = False,
     ):
     """
     Returns a dictionary of image names to build scripts and dockerfiles for environment images.
@@ -221,7 +739,7 @@ def get_env_configs_to_build(
     """
     image_scripts = dict()
     base_images = dict()
-    test_specs = get_test_specs_from_dataset(dataset)
+    test_specs = get_test_specs_from_dataset(dataset, multiarch=multiarch)
 
     for test_spec in test_specs:
         # Check if the base image exists
@@ -266,7 +784,14 @@ def build_env_images(
         client: docker.DockerClient,
         dataset: list,
         force_rebuild: bool = False,
-        max_workers: int = 4
+        max_workers: int = 4,
+        use_buildx: bool = False,
+        platforms: list[str] | None = None,
+        output_dir: Path | None = None,
+        registry: str | None = None,
+        cache_dir: Path | None = None,
+        skip_registry: bool = False,
+        multiarch: bool = False,
     ):
     """
     Builds the environment images required for the dataset if they do not already exist.
@@ -277,13 +802,67 @@ def build_env_images(
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
         max_workers (int): Maximum number of workers to use for building images
     """
+    if use_buildx:
+        _check_buildx_builder()
+        _check_skopeo_available()
+        platforms = platforms or ["linux/amd64", "linux/arm64"]
+        if not skip_registry:
+            registry_addr = ensure_registry_running()
+        else:
+            registry_addr = registry or "localhost:5000"
+
+        build_base_images(
+            client, dataset, force_rebuild,
+            use_buildx=True, platforms=platforms,
+            output_dir=output_dir, registry=registry_addr,
+            cache_dir=cache_dir, skip_registry=skip_registry,
+        )
+
+        test_specs = get_test_specs_from_dataset(dataset, multiarch=True)
+        env_configs = {}
+        for x in test_specs:
+            base_ref = f"{registry_addr}/{x.base_image_key}"
+            env_configs[x.env_image_key] = {
+                "setup_script": x.setup_env_script,
+                "dockerfile": get_dockerfile_env(
+                    use_buildx=True, base_image_ref=base_ref,
+                ),
+                "platform": x.platform,
+            }
+
+        pushed_digests: dict[str, str] = {}
+        for image_name, config in env_configs.items():
+            try:
+                tar_path, digest = build_image_buildx(
+                    image_name=image_name,
+                    setup_scripts={"setup_env.sh": config["setup_script"]},
+                    dockerfile=config["dockerfile"],
+                    platforms=platforms,
+                    build_dir=ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                    output_dir=output_dir,
+                    push_to_registry=not skip_registry,
+                    registry=registry_addr,
+                    cache_dir=cache_dir,
+                )
+                pushed_digests[image_name] = digest
+            except Exception:
+                for prev_name, prev_digest in pushed_digests.items():
+                    log_path = (output_dir or ENV_IMAGE_BUILD_DIR) / "logs" / "rollback.log"
+                    logger = setup_logger(prev_name, log_path, mode="a")
+                    _rollback_registry_image(prev_name, registry_addr, logger, prev_digest)
+                    close_logger(logger)
+                raise
+
+        print("Environment images built successfully (buildx).")
+        return list(pushed_digests.keys()), []
+
     # Get the environment images to build from the dataset
     if force_rebuild:
-        env_image_keys = {x.env_image_key for x in get_test_specs_from_dataset(dataset)}
+        env_image_keys = {x.env_image_key for x in get_test_specs_from_dataset(dataset, multiarch=multiarch)}
         for key in env_image_keys:
             remove_image(client, key, "quiet")
-    build_base_images(client, dataset, force_rebuild)
-    configs_to_build = get_env_configs_to_build(client, dataset)
+    build_base_images(client, dataset, force_rebuild, multiarch=multiarch)
+    configs_to_build = get_env_configs_to_build(client, dataset, multiarch=multiarch)
     if len(configs_to_build) == 0:
         print("No environment images need to be built.")
         return [], []
@@ -341,7 +920,14 @@ def build_instance_images(
         client: docker.DockerClient,
         dataset: list,
         force_rebuild: bool = False,
-        max_workers: int = 4
+        max_workers: int = 4,
+        use_buildx: bool = False,
+        platforms: list[str] | None = None,
+        output_dir: Path | None = None,
+        registry: str | None = None,
+        cache_dir: Path | None = None,
+        skip_registry: bool = False,
+        multiarch: bool = False,
     ):
     """
     Builds the instance images required for the dataset if they do not already exist.
@@ -352,12 +938,59 @@ def build_instance_images(
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
         max_workers (int): Maximum number of workers to use for building images
     """
+    if use_buildx:
+        _check_buildx_builder()
+        _check_skopeo_available()
+        platforms = platforms or ["linux/amd64", "linux/arm64"]
+        if not skip_registry:
+            registry_addr = ensure_registry_running()
+        else:
+            registry_addr = registry or "localhost:5000"
+
+        build_env_images(
+            client, dataset, force_rebuild, max_workers,
+            use_buildx=True, platforms=platforms,
+            output_dir=output_dir, registry=registry_addr,
+            cache_dir=cache_dir, skip_registry=skip_registry,
+        )
+
+        test_specs = [make_test_spec(inst, multiarch=True) for inst in dataset]
+        successful, failed = [], []
+        for spec in test_specs:
+            instance_platforms = ["linux/amd64"] if spec.instance_id in USE_X86 else platforms
+            env_ref = f"{registry_addr}/{spec.env_image_key}"
+            instance_dockerfile = get_dockerfile_instance(
+                use_buildx=True, env_image_ref=env_ref,
+            )
+            try:
+                tar_path, digest = build_image_buildx(
+                    image_name=spec.instance_image_key,
+                    setup_scripts={"setup_repo.sh": spec.install_repo_script},
+                    dockerfile=instance_dockerfile,
+                    platforms=instance_platforms,
+                    build_dir=INSTANCE_IMAGE_BUILD_DIR / spec.instance_image_key.replace(":", "__"),
+                    output_dir=output_dir,
+                    push_to_registry=False,
+                    registry=registry_addr,
+                    cache_dir=cache_dir,
+                )
+                successful.append(spec)
+            except Exception:
+                traceback.print_exc()
+                failed.append(spec)
+
+        if len(failed) == 0:
+            print("All instance images built successfully (buildx).")
+        else:
+            print(f"{len(failed)} instance images failed to build (buildx).")
+        return successful, failed
+
     # Build environment images (and base images as needed) first
-    test_specs = list(map(make_test_spec, dataset))
+    test_specs = [make_test_spec(inst, multiarch=multiarch) for inst in dataset]
     if force_rebuild:
         for spec in test_specs:
             remove_image(client, spec.instance_image_key, "quiet")
-    _, env_failed = build_env_images(client, test_specs, force_rebuild, max_workers)
+    _, env_failed = build_env_images(client, test_specs, force_rebuild, max_workers, multiarch=multiarch)
 
     if len(env_failed) > 0:
         # Don't build images for instances that depend on failed-to-build env images

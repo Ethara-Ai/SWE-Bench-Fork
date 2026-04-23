@@ -827,6 +827,24 @@ SPECS_SQLFLUFF = {
         "2.2",
     ]
 }
+SPECS_SQLFLUFF.update({
+    k: {
+        "python": "3.9",
+        "packages": "requirements.txt",
+        "install": "python -m pip install -e .",
+        "test_cmd": TEST_PYTEST,
+    }
+    for k in [
+        "2.3",
+        "2.4",
+        "3.0",
+        "3.1",
+        "3.2",
+        "3.3",
+        "4.0",
+        "4.1",
+    ]
+})
 
 SPECS_DBT_CORE = {
     k: {

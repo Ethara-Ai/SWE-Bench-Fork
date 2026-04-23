@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import requests
+import socket
 import time
 
 from bs4 import BeautifulSoup
@@ -16,6 +17,9 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Set global socket timeout to prevent ghapi from hanging forever on stalled connections
+socket.setdefaulttimeout(120)
 
 
 class Repo:
@@ -44,7 +48,8 @@ class Repo:
         Return:
             values (dict): response object of `func`
         """
-        while True:
+        max_retries = 5
+        for attempt in range(max_retries):
             try:
                 values = func(**kwargs)
                 return values
@@ -61,6 +66,19 @@ class Repo:
             except HTTP404NotFoundError as e:
                 logger.info(f"[{self.owner}/{self.name}] Resource not found {kwargs}")
                 return None
+            except Exception as e:
+                err_str = str(e).lower()
+                is_conn_err = any(kw in err_str for kw in
+                    ("connection", "reset", "closed", "timeout", "timed out", "eof"))
+                if is_conn_err and attempt < max_retries - 1:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(
+                        f"[{self.owner}/{self.name}] Connection error (attempt {attempt+1}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s"
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
 
     def extract_resolved_issues(self, pull: dict) -> list[str]:
         """
@@ -153,6 +171,11 @@ class Repo:
                     f"[{self.owner}/{self.name}] Error processing page {page} "
                     f"w/ token {self.token[:10]} - {e}"
                 )
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("connection", "reset", "closed", "timeout", "timed out", "eof")):
+                    logger.info(f"[{self.owner}/{self.name}] Connection error, backing off 30s before retry")
+                    time.sleep(30)
+                    continue
                 while True:
                     rl = self.api.rate_limit.get()
                     if rl.resources.core.remaining > 0:

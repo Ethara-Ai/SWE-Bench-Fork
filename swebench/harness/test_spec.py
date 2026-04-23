@@ -27,6 +27,7 @@ from swebench.harness.utils import (
     get_environment_yml,
     get_test_directives,
 )
+from swebench.harness._image_utils import _proxy_hash_suffix
 
 DIFF_MODIFIED_FILE_REGEX = r"--- a/(.*)"
 
@@ -45,6 +46,7 @@ class TestSpec:
     arch: str
     FAIL_TO_PASS: list[str]
     PASS_TO_PASS: list[str]
+    multiarch: bool = False
 
     @property
     def setup_env_script(self):
@@ -61,24 +63,24 @@ class TestSpec:
 
     @property
     def base_image_key(self):
-        return f"sweb.base.{self.arch}:latest"
+        if self.multiarch:
+            return f"sweb.base{_proxy_hash_suffix()}:latest"
+        return f"sweb.base.{self.arch}{_proxy_hash_suffix()}:latest"
 
     @property
     def env_image_key(self):
-        """
-        The key for the environment image is based on the hash of the environment script list.
-        If the environment script list changes, the image will be rebuilt automatically.
-
-        Note that old images are not automatically deleted, so consider cleaning up old images periodically.
-        """
         hash_object = hashlib.sha256()
         hash_object.update(str(self.env_script_list).encode("utf-8"))
         hash_value = hash_object.hexdigest()
-        val = hash_value[:22]  # 22 characters is still very likely to be unique
-        return f"sweb.env.{self.arch}.{val}:latest"
+        val = hash_value[:22]
+        if self.multiarch:
+            return f"sweb.env.{val}{_proxy_hash_suffix()}:latest"
+        return f"sweb.env.{self.arch}.{val}{_proxy_hash_suffix()}:latest"
 
     @property
     def instance_image_key(self):
+        if self.multiarch:
+            return f"sweb.eval.{self.instance_id}:latest"
         return f"sweb.eval.{self.arch}.{self.instance_id}:latest"
 
     def get_instance_container_name(self, run_id=None):
@@ -88,15 +90,20 @@ class TestSpec:
 
     @property
     def base_dockerfile(self):
-        return get_dockerfile_base(self.platform, self.arch)
+        return get_dockerfile_base(self.platform, self.arch, use_buildx=self.multiarch)
 
     @property
     def env_dockerfile(self):
-        return get_dockerfile_env(self.platform, self.arch)
+        return get_dockerfile_env(
+            self.platform, self.arch, use_buildx=self.multiarch,
+            base_image_key=self.base_image_key,
+        )
 
     @property
     def instance_dockerfile(self):
-        return get_dockerfile_instance(self.platform, self.env_image_key)
+        return get_dockerfile_instance(
+            self.platform, self.env_image_key, use_buildx=self.multiarch,
+        )
 
     @property
     def platform(self):
@@ -108,13 +115,19 @@ class TestSpec:
             raise ValueError(f"Invalid architecture: {self.arch}")
 
 
-def get_test_specs_from_dataset(dataset: Union[list[SWEbenchInstance], list[TestSpec]]) -> list[TestSpec]:
+def get_test_specs_from_dataset(
+    dataset: Union[list[SWEbenchInstance], list[TestSpec]],
+    multiarch: bool = False,
+) -> list[TestSpec]:
     """
     Idempotent function that converts a list of SWEbenchInstance objects to a list of TestSpec objects.
     """
     if isinstance(dataset[0], TestSpec):
         return cast(list[TestSpec], dataset)
-    return list(map(make_test_spec, cast(list[SWEbenchInstance], dataset)))
+    return [
+        make_test_spec(instance, multiarch=multiarch)
+        for instance in cast(list[SWEbenchInstance], dataset)
+    ]
 
 
 def make_repo_script_list(specs, repo, repo_directory, base_commit, env_name):
@@ -300,7 +313,7 @@ def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit
     return eval_commands
 
 
-def make_test_spec(instance: SWEbenchInstance) -> TestSpec:
+def make_test_spec(instance: SWEbenchInstance, multiarch: bool = False) -> TestSpec:
     if isinstance(instance, TestSpec):
         return instance
     instance_id = instance[KEY_INSTANCE_ID]
@@ -317,21 +330,13 @@ def make_test_spec(instance: SWEbenchInstance) -> TestSpec:
 
     def _from_json_or_obj(key: str) -> Any:
         """If key points to string, load with json"""
-        if isinstance(instance[key], str):
-            return json.loads(instance[key])
-        return instance[key]
+        val = instance.get(key, [])
+        if isinstance(val, str):
+            return json.loads(val)
+        return val
 
-    try:
-        pass_to_pass = _from_json_or_obj(PASS_TO_PASS)
-    except Exception as e:
-        print(f"Error parsing PASS_TO_PASS for instance {instance_id}: {e}. PASS_TO_PASS: {instance[PASS_TO_PASS]}")
-        pass_to_pass = []
-
-    try:
-        fail_to_pass = _from_json_or_obj(FAIL_TO_PASS)
-    except Exception as e:
-        print(f"Error parsing FAIL_TO_PASS for instance {instance_id}: {e}. FAIL_TO_PASS: {instance[FAIL_TO_PASS]}")
-        fail_to_pass = []
+    pass_to_pass = _from_json_or_obj(PASS_TO_PASS)
+    fail_to_pass = _from_json_or_obj(FAIL_TO_PASS)
 
     env_name = "testbed"
     repo_directory = f"/{env_name}"
@@ -358,4 +363,5 @@ def make_test_spec(instance: SWEbenchInstance) -> TestSpec:
         arch=arch,
         FAIL_TO_PASS=fail_to_pass,
         PASS_TO_PASS=pass_to_pass,
+        multiarch=multiarch,
     )

@@ -26,6 +26,7 @@ from swebench.harness.docker_utils import (
     list_images,
     should_remove,
     clean_images,
+    ensure_image_loaded,
 )
 from swebench.harness.docker_build import (
     BuildImageError,
@@ -283,6 +284,7 @@ def run_instances(
         max_workers: int,
         run_id: str,
         timeout: int,
+        multiarch: bool = False,
     ):
     """
     Run all instances for the given predictions in parallel.
@@ -298,7 +300,7 @@ def run_instances(
         timeout (int): Timeout for running tests
     """
     client = docker.from_env()
-    test_specs = list(map(make_test_spec, instances))
+    test_specs = [make_test_spec(inst, multiarch=multiarch) for inst in instances]
 
     # print number of existing instance images
     instance_image_ids = {x.instance_image_key for x in test_specs}
@@ -461,6 +463,7 @@ def main(
         open_file_limit: int,
         run_id: str,
         timeout: int,
+        multiarch: bool = False,
     ):
     """
     Run evaluation harness for the given dataset and predictions.
@@ -484,9 +487,9 @@ def main(
         print("No instances to run.")
     else:
         # build environment images + run instances
-        build_env_images(client, dataset, force_rebuild, max_workers)
+        build_env_images(client, dataset, force_rebuild, max_workers, multiarch=multiarch)
         # this time w/ golden predictions (patch)
-        run_instances(predictions, dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout)
+        run_instances(predictions, dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout, multiarch=multiarch)
 
     # # --- run empty predictions ---
     print("Using empty predictions")
@@ -496,7 +499,7 @@ def main(
 
     # this will remove the container in the gloden run
     delete_instance_container(client, empty_dataset)
-    run_instances(empty_predictions, empty_dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout)
+    run_instances(empty_predictions, empty_dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout, multiarch=multiarch)
 
     # clean images + make final report
     clean_images(client, existing_images, cache_level, clean)
@@ -527,5 +530,6 @@ if __name__ == "__main__":
         "--clean", type=str2bool, default=False, help="Clean images above cache level"
     )
     parser.add_argument("--run_id", type=str, required=True, help="Run ID - identifies the run")
+    parser.add_argument("--multiarch", type=str2bool, default=False, help="Use arch-free image names (for multi-arch buildx images)")
     args = parser.parse_args()
     main(**vars(args))

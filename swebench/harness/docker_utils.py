@@ -3,7 +3,10 @@ from __future__ import annotations
 import docker
 import docker.errors
 import os
+import platform as _platform_mod
 import signal
+import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -297,23 +300,93 @@ def clean_images(
     print(f"Removed {removed} images.")
 
 
-def should_remove(
-        image_name: str,
-        cache_level: str,
-        clean: bool,
-        prior_images: set
-    ):
-    """
-    Determine if an image should be removed based on cache level and clean flag.
-    """
+def detect_host_arch() -> str:
+    machine = _platform_mod.machine().lower()
+    if sys.platform == "darwin" and machine in ("x86_64", "i386"):
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "sysctl.proc_translated"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip() == "1":
+                return "arm64"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    elif machine in ("x86_64", "amd64", "i386", "i686"):
+        return "amd64"
+    else:
+        raise RuntimeError(f"Unsupported host architecture: {machine}")
+
+
+def load_oci_tar(
+    tar_path,
+    image_name: str,
+    arch: str | None = None,
+    logger=None,
+) -> None:
+    if arch is None:
+        arch = detect_host_arch()
+    cmd = [
+        "skopeo", "copy",
+        "--override-os", "linux",
+        "--override-arch", arch,
+        f"oci-archive:{tar_path}",
+        f"docker-daemon:{image_name}",
+    ]
+    if logger:
+        logger.info(f"Loading {tar_path} as {image_name} (arch={arch})")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to load OCI tar {tar_path} as {image_name}: {result.stderr[-500:]}"
+        )
+    if logger:
+        logger.info(f"Loaded {image_name} from {tar_path}")
+
+
+def ensure_image_loaded(
+    image_name: str,
+    tar_dir,
+    arch: str | None = None,
+    client=None,
+    logger=None,
+) -> None:
+    if client is None:
+        client = docker.from_env()
+    try:
+        client.images.get(image_name)
+        if logger:
+            logger.debug(f"Image {image_name} already loaded")
+        return
+    except docker.errors.ImageNotFound:
+        pass
+    tar_name = image_name.replace(":", "_").replace("/", "_") + ".tar"
+    tar_dir = Path(tar_dir)
+    search_paths = [
+        tar_dir / tar_name,
+        tar_dir / "env" / tar_name,
+        tar_dir / "instances" / tar_name,
+    ]
+    for tar_path in search_paths:
+        if tar_path.exists():
+            load_oci_tar(tar_path, image_name, arch=arch, logger=logger)
+            return
+    raise FileNotFoundError(
+        f"OCI tar for {image_name} not found. Searched: {[str(p) for p in search_paths]}"
+    )
+
+
+def should_remove(image_name: str, cache_level: str, clean: bool, prior_images: set) -> bool:
+    name = image_name
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
     existed_before = image_name in prior_images
-    if image_name.startswith("sweb.base"):
-        if cache_level in {"none"} and (clean or not existed_before):
-            return True
-    elif image_name.startswith("sweb.env"):
-        if cache_level in {"none", "base"} and (clean or not existed_before):
-            return True
-    elif image_name.startswith("sweb.eval"):
-        if cache_level in {"none", "base", "env"} and (clean or not existed_before):
-            return True
+    if name.startswith("sweb.base"):
+        return cache_level in ("none",) and (clean or not existed_before)
+    elif name.startswith("sweb.env"):
+        return cache_level in ("none", "base") and (clean or not existed_before)
+    elif name.startswith("sweb.eval"):
+        return cache_level in ("none", "base", "env") and (clean or not existed_before)
     return False
