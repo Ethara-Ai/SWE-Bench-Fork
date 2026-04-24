@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import traceback
+from dataclasses import dataclass
 
 import docker
 import docker.errors
@@ -211,23 +212,172 @@ def _check_skopeo_available():
         )
 
 
-def _check_buildx_builder(builder_name: str = "swegym-multiarch"):
+@dataclass
+class RegistryAddrs:
+    """Registry addresses for host-side and buildkit-side operations.
+
+    On Linux native Docker, both are ``localhost:<port>``.
+    On Docker Desktop (macOS/Windows), buildkitd runs in a VM where
+    ``localhost`` points at the VM's own loopback — not the host.
+    ``buildkit`` is set to the host-gateway IP so buildkitd's FROM
+    image resolution can reach the host registry.
+    """
+    host: str
+    buildkit: str
+
+
+_BUILDKITD_TOML_DIR = Path.home() / ".swe-bench"
+
+
+def _is_docker_desktop() -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{.OperatingSystem}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "Desktop" in (result.stdout or "")
+    except Exception:
+        return False
+
+
+def _discover_host_gateway_ip() -> str | None:
+    """Discover the host-gateway IP that buildkitd can use to reach the host.
+
+    On Docker Desktop, ``host-gateway`` resolves to the VM-internal IP of the
+    macOS/Windows host (e.g. 192.168.65.254).  This IP is reachable from
+    containers using ``--network host`` (which gives the VM's namespace).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--add-host=host.docker.internal:host-gateway",
+                "alpine", "grep", "host.docker.internal", "/etc/hosts",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and "host.docker.internal" in parts[1]:
+                ip = parts[0]
+                # Skip IPv6 entries
+                if ":" not in ip:
+                    return ip
+        return None
+    except Exception:
+        return None
+
+
+def _get_buildkit_registry_addr(port: int) -> str:
+    if not _is_docker_desktop():
+        return f"localhost:{port}"
+
+    ip = _discover_host_gateway_ip()
+    if ip:
+        print(f"Docker Desktop detected — buildkitd will reach registry via {ip}:{port}")
+        return f"{ip}:{port}"
+
+    print(
+        "WARNING: Docker Desktop detected but host-gateway IP discovery failed.\n"
+        "Falling back to localhost:5000 — buildx FROM lines may time out.\n"
+        "Workaround: pass --registry <reachable-host-ip>:5000"
+    )
+    return f"localhost:{port}"
+
+
+def _ensure_buildkitd_toml(buildkit_addr: str) -> Path | None:
+    """Generate a buildkitd.toml with HTTP access for the given registry address.
+
+    BuildKit auto-allows HTTP for ``localhost`` / ``127.0.0.1``, but any other
+    address (like a host-gateway IP) needs explicit ``http = true``.
+
+    Returns the config file path, or None if no config is needed.
+    """
+    host_part = buildkit_addr.split(":")[0] if ":" in buildkit_addr else buildkit_addr
+    if host_part in ("localhost", "127.0.0.1"):
+        return None
+
+    _BUILDKITD_TOML_DIR.mkdir(parents=True, exist_ok=True)
+    toml_path = _BUILDKITD_TOML_DIR / "buildkitd.toml"
+
+    content = (
+        f'[registry."{buildkit_addr}"]\n'
+        f'  http = true\n'
+        f'  insecure = true\n'
+    )
+
+    if toml_path.exists() and toml_path.read_text() == content:
+        return toml_path
+
+    toml_path.write_text(content)
+    return toml_path
+
+
+def _make_registry_addrs(user_addr: str) -> RegistryAddrs:
+    """Convert a user-provided registry address string to RegistryAddrs.
+
+    If the address is localhost-based and we're on Docker Desktop,
+    the buildkit address is swapped to the host-gateway IP so that
+    buildkitd can reach the registry.
+    """
+    host_part = user_addr.split(":")[0] if ":" in user_addr else user_addr
+    port_part = user_addr.split(":")[1] if ":" in user_addr else "5000"
+    if host_part in ("localhost", "127.0.0.1"):
+        buildkit_addr = _get_buildkit_registry_addr(int(port_part))
+        return RegistryAddrs(host=user_addr, buildkit=buildkit_addr)
+    return RegistryAddrs(host=user_addr, buildkit=user_addr)
+
+
+def _check_buildx_builder(
+    builder_name: str = "swegym-multiarch",
+    buildkitd_toml: Path | None = None,
+):
     result = subprocess.run(
         ["docker", "buildx", "inspect", "--bootstrap", builder_name],
         capture_output=True, text=True, timeout=60,
     )
-    if result.returncode != 0:
-        print(f"Builder '{builder_name}' not found — creating with host networking...")
-        create = subprocess.run(
-            [
-                "docker", "buildx", "create",
-                "--name", builder_name,
-                "--driver", "docker-container",
-                "--driver-opt", "network=host",
-                "--bootstrap",
-            ],
-            capture_output=True, text=True, timeout=120,
+
+    needs_create = result.returncode != 0
+    needs_recreate = False
+
+    if not needs_create:
+        if "network=" in result.stdout and 'network="host"' not in result.stdout:
+            print(
+                f"WARNING: Builder '{builder_name}' exists but lacks --driver-opt network=host.\n"
+                f"Recreating to fix registry access..."
+            )
+            needs_recreate = True
+
+        if buildkitd_toml and "buildkitd.toml" not in result.stdout:
+            print(
+                f"Builder '{builder_name}' exists without buildkitd config.\n"
+                f"Recreating with registry config for Docker Desktop compatibility..."
+            )
+            needs_recreate = True
+
+    if needs_recreate:
+        print(f"Removing existing builder '{builder_name}'...")
+        subprocess.run(
+            ["docker", "buildx", "rm", builder_name],
+            capture_output=True, text=True, timeout=30,
         )
+        needs_create = True
+
+    if needs_create:
+        print(f"Builder '{builder_name}' not found — creating with host networking...")
+        cmd = [
+            "docker", "buildx", "create",
+            "--name", builder_name,
+            "--driver", "docker-container",
+            "--driver-opt", "network=host",
+        ]
+        if buildkitd_toml:
+            cmd.extend(["--buildkitd-config", str(buildkitd_toml)])
+        cmd.append("--bootstrap")
+
+        create = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if create.returncode != 0:
             raise RuntimeError(
                 f"Failed to create buildx builder '{builder_name}': {create.stderr}\n"
@@ -237,15 +387,6 @@ def _check_buildx_builder(builder_name: str = "swegym-multiarch"):
         result = subprocess.run(
             ["docker", "buildx", "inspect", builder_name],
             capture_output=True, text=True, timeout=30,
-        )
-
-    if "network=" in result.stdout and 'network="host"' not in result.stdout:
-        print(
-            f"WARNING: Builder '{builder_name}' exists but lacks --driver-opt network=host.\n"
-            f"Registry access from buildx will fail. Recreate with:\n"
-            f"  docker buildx rm {builder_name}\n"
-            f"  docker buildx create --name {builder_name} --driver docker-container "
-            f"--driver-opt network=host --bootstrap"
         )
 
     if "linux/amd64" not in result.stdout or "linux/arm64" not in result.stdout:
@@ -258,18 +399,25 @@ def _check_buildx_builder(builder_name: str = "swegym-multiarch"):
 def ensure_registry_running(
     port: int = 5000,
     timeout: int = 30,
-) -> str:
-    """Start a local OCI registry if not already running. Returns 'localhost:{port}'."""
+) -> RegistryAddrs:
+    """Start a local OCI registry if not already running.
+
+    Returns a RegistryAddrs with host-side and buildkit-side addresses.
+    """
     import urllib.request
     import time
 
-    addr = f"localhost:{port}"
-    health_url = f"http://{addr}/v2/"
+    host_addr = f"localhost:{port}"
+    health_url = f"http://{host_addr}/v2/"
+
+    def _make_addrs() -> RegistryAddrs:
+        buildkit_addr = _get_buildkit_registry_addr(port)
+        return RegistryAddrs(host=host_addr, buildkit=buildkit_addr)
 
     try:
         urllib.request.urlopen(health_url, timeout=3)
-        if _probe_registry_push(addr):
-            return addr
+        if _probe_registry_push(host_addr):
+            return _make_addrs()
     except Exception:
         pass
 
@@ -300,8 +448,8 @@ def ensure_registry_running(
     while elapsed < timeout:
         try:
             urllib.request.urlopen(health_url, timeout=2)
-            if _probe_registry_push(addr):
-                return addr
+            if _probe_registry_push(host_addr):
+                return _make_addrs()
         except Exception:
             pass
         time.sleep(delay)
@@ -650,7 +798,7 @@ def build_base_images(
         use_buildx: bool = False,
         platforms: list[str] | None = None,
         output_dir: Path | None = None,
-        registry: str | None = None,
+        registry: str | RegistryAddrs | None = None,
         cache_dir: Path | None = None,
         skip_registry: bool = False,
         multiarch: bool = False,
@@ -664,13 +812,17 @@ def build_base_images(
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
     """
     if use_buildx:
-        _check_buildx_builder()
+        if isinstance(registry, RegistryAddrs):
+            registry_addrs = registry
+        elif not skip_registry:
+            registry_addrs = ensure_registry_running()
+        else:
+            registry_addrs = _make_registry_addrs(registry or "localhost:5000")
+
+        toml = _ensure_buildkitd_toml(registry_addrs.buildkit)
+        _check_buildx_builder(buildkitd_toml=toml)
         _check_skopeo_available()
         platforms = platforms or ["linux/amd64", "linux/arm64"]
-        if not skip_registry:
-            registry_addr = ensure_registry_running()
-        else:
-            registry_addr = registry or "localhost:5000"
 
         test_specs = get_test_specs_from_dataset(dataset, multiarch=True)
         base_images = {x.base_image_key: (x.base_dockerfile, x.platform) for x in test_specs}
@@ -683,7 +835,7 @@ def build_base_images(
                 build_dir=BASE_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
                 output_dir=output_dir,
                 push_to_registry=not skip_registry,
-                registry=registry_addr,
+                registry=registry_addrs.host,
                 cache_dir=cache_dir,
             )
         print("Base images built successfully (buildx).")
@@ -788,7 +940,7 @@ def build_env_images(
         use_buildx: bool = False,
         platforms: list[str] | None = None,
         output_dir: Path | None = None,
-        registry: str | None = None,
+        registry: str | RegistryAddrs | None = None,
         cache_dir: Path | None = None,
         skip_registry: bool = False,
         multiarch: bool = False,
@@ -803,25 +955,27 @@ def build_env_images(
         max_workers (int): Maximum number of workers to use for building images
     """
     if use_buildx:
-        _check_buildx_builder()
+        if isinstance(registry, RegistryAddrs):
+            registry_addrs = registry
+        elif not skip_registry:
+            registry_addrs = ensure_registry_running()
+        else:
+            registry_addrs = _make_registry_addrs(registry or "localhost:5000")
+
         _check_skopeo_available()
         platforms = platforms or ["linux/amd64", "linux/arm64"]
-        if not skip_registry:
-            registry_addr = ensure_registry_running()
-        else:
-            registry_addr = registry or "localhost:5000"
 
         build_base_images(
             client, dataset, force_rebuild,
             use_buildx=True, platforms=platforms,
-            output_dir=output_dir, registry=registry_addr,
+            output_dir=output_dir, registry=registry_addrs,
             cache_dir=cache_dir, skip_registry=skip_registry,
         )
 
         test_specs = get_test_specs_from_dataset(dataset, multiarch=True)
         env_configs = {}
         for x in test_specs:
-            base_ref = f"{registry_addr}/{x.base_image_key}"
+            base_ref = f"{registry_addrs.buildkit}/{x.base_image_key}"
             env_configs[x.env_image_key] = {
                 "setup_script": x.setup_env_script,
                 "dockerfile": get_dockerfile_env(
@@ -841,7 +995,7 @@ def build_env_images(
                     build_dir=ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
                     output_dir=output_dir,
                     push_to_registry=not skip_registry,
-                    registry=registry_addr,
+                    registry=registry_addrs.host,
                     cache_dir=cache_dir,
                 )
                 pushed_digests[image_name] = digest
@@ -849,7 +1003,7 @@ def build_env_images(
                 for prev_name, prev_digest in pushed_digests.items():
                     log_path = (output_dir or ENV_IMAGE_BUILD_DIR) / "logs" / "rollback.log"
                     logger = setup_logger(prev_name, log_path, mode="a")
-                    _rollback_registry_image(prev_name, registry_addr, logger, prev_digest)
+                    _rollback_registry_image(prev_name, registry_addrs.host, logger, prev_digest)
                     close_logger(logger)
                 raise
 
@@ -924,7 +1078,7 @@ def build_instance_images(
         use_buildx: bool = False,
         platforms: list[str] | None = None,
         output_dir: Path | None = None,
-        registry: str | None = None,
+        registry: str | RegistryAddrs | None = None,
         cache_dir: Path | None = None,
         skip_registry: bool = False,
         multiarch: bool = False,
@@ -939,18 +1093,20 @@ def build_instance_images(
         max_workers (int): Maximum number of workers to use for building images
     """
     if use_buildx:
-        _check_buildx_builder()
+        if isinstance(registry, RegistryAddrs):
+            registry_addrs = registry
+        elif not skip_registry:
+            registry_addrs = ensure_registry_running()
+        else:
+            registry_addrs = _make_registry_addrs(registry or "localhost:5000")
+
         _check_skopeo_available()
         platforms = platforms or ["linux/amd64", "linux/arm64"]
-        if not skip_registry:
-            registry_addr = ensure_registry_running()
-        else:
-            registry_addr = registry or "localhost:5000"
 
         build_env_images(
             client, dataset, force_rebuild, max_workers,
             use_buildx=True, platforms=platforms,
-            output_dir=output_dir, registry=registry_addr,
+            output_dir=output_dir, registry=registry_addrs,
             cache_dir=cache_dir, skip_registry=skip_registry,
         )
 
@@ -958,7 +1114,7 @@ def build_instance_images(
         successful, failed = [], []
         for spec in test_specs:
             instance_platforms = ["linux/amd64"] if spec.instance_id in USE_X86 else platforms
-            env_ref = f"{registry_addr}/{spec.env_image_key}"
+            env_ref = f"{registry_addrs.buildkit}/{spec.env_image_key}"
             instance_dockerfile = get_dockerfile_instance(
                 use_buildx=True, env_image_ref=env_ref,
             )
@@ -971,7 +1127,7 @@ def build_instance_images(
                     build_dir=INSTANCE_IMAGE_BUILD_DIR / spec.instance_image_key.replace(":", "__"),
                     output_dir=output_dir,
                     push_to_registry=False,
-                    registry=registry_addr,
+                    registry=registry_addrs.host,
                     cache_dir=cache_dir,
                 )
                 successful.append(spec)
