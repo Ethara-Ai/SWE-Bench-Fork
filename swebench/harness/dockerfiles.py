@@ -37,7 +37,10 @@ _CA_CERT_BLOCK = r"""
 RUN mkdir -p /etc/pki/tls/certs /etc/pki/ca-trust/extracted/pem /etc/ssl/certs /usr/local/share/ca-certificates && \
     ln -sf /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt && \
     ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem && \
-    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/ca-bundle.pem
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/ca-bundle.pem && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/cacert.pem && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem && \
+    ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt
 """
 
 # BuildKit secret mount: cert at /run/secrets/mitm_ca injected into trust store
@@ -123,7 +126,7 @@ def get_dockerfile_base(platform: str, arch: str, use_buildx: bool = False) -> s
     if use_buildx:
         from_line = "ubuntu:22.04"
         body = _DOCKERFILE_BASE.safe_substitute(from_line=from_line)
-        marker = "ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/ca-bundle.pem\n"
+        marker = "ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt\n"
         body = body.replace(marker, marker + _MITM_CA_BLOCK, 1)
         return _BUILDKIT_HEADER + body
     from_line = f"--platform={platform} ubuntu:22.04"
